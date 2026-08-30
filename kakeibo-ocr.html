@@ -1,0 +1,434 @@
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  #app {
+    font-family: 'Zen Kaku Gothic New','Hiragino Sans',sans-serif;
+    background: #ECE8DC;
+    background-image: linear-gradient(#C7BFAB 1px, transparent 1px), linear-gradient(90deg, #C7BFAB 1px, transparent 1px);
+    background-size: 24px 24px;
+    color: #2B2A28;
+    padding: 20px 14px 60px;
+    min-height: 100vh;
+  }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .card { background: #FBFAF6; border: 1px solid #C7BFAB; border-radius: 4px; }
+  .section-label { display:flex; align-items:baseline; gap:8px; margin-bottom:8px; }
+  .section-label .idx { font-family:'JetBrains Mono',monospace; font-size:11px; color:#A63A3A; font-weight:700; }
+  .section-label .title { font-size:13.5px; font-weight:700; color:#5C574C; }
+  .section-label .line { flex:1; height:1px; background:#C7BFAB; }
+  button { font-family: inherit; cursor: pointer; }
+  input, select { font-family: inherit; }
+  .btn-primary { flex:1; background:#33475B; color:#FBFAF6; border:none; border-radius:4px; padding:12px 10px; font-size:13.5px; font-weight:700; }
+  .btn-secondary { flex:1; background:#FBFAF6; color:#33475B; border:1px solid #33475B; border-radius:4px; padding:12px 10px; font-size:13.5px; font-weight:700; }
+  .input { padding:8px 10px; border-radius:3px; border:1px solid #C7BFAB; font-size:13px; width:100%; }
+  .empty { border:1px dashed #C7BFAB; border-radius:4px; padding:16px; margin-bottom:20px; text-align:center; font-size:12.5px; color:#5C574C; background:#FBFAF6; }
+  .row { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; border-bottom:1px dashed #C7BFAB; }
+  .row:last-child { border-bottom:none; }
+</style>
+<script>
+(function () {
+  const CATEGORIES = ["食費", "日用品", "外食", "交通", "その他"];
+  const CATEGORY_COLORS = { 食費:"#A63A3A", 日用品:"#33475B", 外食:"#B8863B", 交通:"#4B6B4E", その他:"#8A8375" };
+  const STORAGE_KEY = "kakeibo:receipts";
+  let receipts = [];
+  let pendingImage = null; // { dataUrl, guessedAmount }
+  let charts = {};
+
+  const app = document.getElementById("app");
+  const yen = n => "¥" + Number(n).toLocaleString("ja-JP");
+  const todayISO = () => new Date().toISOString().slice(0,10);
+  const monthKey = d => d.slice(0,7);
+  const monthLabel = k => `${Number(k.split("-")[1])}月`;
+
+  window.addEventListener("error", (e) => {
+    const el = document.getElementById("statusMsg");
+    if (el) el.textContent = "エラーが発生しました: " + e.message;
+  });
+
+  async function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) receipts = JSON.parse(raw);
+    } catch (e) { /* 未保存なら空のまま */ }
+    render();
+  }
+
+  async function persist() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(receipts)); }
+    catch (e) { console.error("保存に失敗しました", e); setStatus("保存に失敗しました"); }
+  }
+
+  function addReceipt(r) {
+    receipts.unshift(r);
+    persist();
+    render();
+  }
+
+  function deleteReceipt(id) {
+    receipts = receipts.filter(r => r.id !== id);
+    persist();
+    render();
+  }
+
+  // レシートOCRの生テキストから店名らしき行を推測する簡易パーサー
+  function guessStore(text) {
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const skipPattern = /^[\d¥\uFFE5,.\-\s]+$/; // 数字だけの行は除外
+    for (const line of lines.slice(0, 6)) { // 上の方の行を優先的に見る
+      if (line.length < 2) continue;
+      if (skipPattern.test(line)) continue;
+      if (/円|合計|小計|お預り|お釣り|税込|税抜|領収|レシート/.test(line)) continue;
+      return line;
+    }
+    return "";
+  }
+
+  // レシートOCRの生テキストから合計金額らしき数字を推測する簡易パーサー
+  function guessAmount(text) {
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    let best = null;
+    const totalKeywords = ["合計", "御合計", "ご合計", "小計", "計", "total", "Total", "TOTAL", "お預り", "お会計"];
+    const nums = [];
+    for (const line of lines) {
+      const hasKeyword = totalKeywords.some(k => line.includes(k));
+      // ¥1,234 / 1,234円 / 1234 のような数字パターンを幅広く拾う
+      const matches = line.match(/[¥\uFFE5]?\s?\d{1,3}(,\d{3})+|[¥\uFFE5]\s?\d{2,}|\d{2,}\s?円/g);
+      if (matches) {
+        for (const m of matches) {
+          const num = Number(m.replace(/[^\d]/g, ""));
+          if (!isNaN(num) && num > 0 && num < 1000000) {
+            if (hasKeyword) return num; // 「合計」などの行の数字を最優先
+            nums.push(num);
+          }
+        }
+      }
+    }
+    // キーワード行が見つからなければ、拾えた数字の中で最大値を採用(合計は内訳より大きいことが多い)
+    if (nums.length) best = Math.max(...nums);
+    return best;
+  }
+
+  function setStatus(msg) {
+    const el = document.getElementById("statusMsg");
+    if (el) el.textContent = msg || "";
+  }
+
+  async function handleFile(file) {
+    if (!file) { setStatus("画像が選択されませんでした"); return; }
+    setStatus("画像を読み込み中…");
+    const reader = new FileReader();
+    reader.onerror = () => setStatus("画像の読み込みに失敗しました");
+    reader.onload = async (e) => {
+      pendingImage = { dataUrl: e.target.result, guessedAmount: null, store: "", category: "食費", loading: true, error: false };
+      setStatus("");
+      render();
+      try {
+        if (typeof Tesseract === "undefined") throw new Error("Tesseractが読み込まれていません");
+        const { data } = await Tesseract.recognize(e.target.result, "jpn+eng");
+        pendingImage.rawText = data.text || "";
+        pendingImage.guessedAmount = guessAmount(data.text) || "";
+        pendingImage.store = guessStore(data.text) || "";
+        pendingImage.loading = false;
+      } catch (err) {
+        pendingImage.loading = false;
+        pendingImage.error = true;
+        setStatus("文字の読み取りに失敗しました。金額は手入力してください");
+      }
+      render();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function confirmPending(amount, store, category) {
+    if (!amount || !store) return;
+    addReceipt({
+      id: String(Date.now()) + Math.random().toString(36).slice(2,7),
+      store, amount: Number(amount), category, date: todayISO(),
+    });
+    pendingImage = null;
+  }
+
+  function render() {
+    const currentMonthKey = monthKey(todayISO());
+    const monthReceipts = receipts.filter(r => monthKey(r.date) === currentMonthKey);
+    const total = monthReceipts.reduce((s,r) => s + r.amount, 0);
+
+    const byCatMap = {}; CATEGORIES.forEach(c => byCatMap[c] = 0);
+    monthReceipts.forEach(r => byCatMap[r.category] += r.amount);
+    const byCategory = CATEGORIES.map(c => ({ name:c, value: byCatMap[c] })).filter(d => d.value > 0);
+
+    const histMap = {};
+    receipts.forEach(r => { const k = monthKey(r.date); histMap[k] = (histMap[k]||0) + r.amount; });
+    if (!histMap[currentMonthKey]) histMap[currentMonthKey] = 0;
+    const history = Object.keys(histMap).sort().slice(-4).map(k => ({ key:k, month: monthLabel(k), total: histMap[k] }));
+    const prevTotal = history.length >= 2 ? history[history.length-2].total : null;
+    const diff = prevTotal === null ? null : total - prevTotal;
+
+    app.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;">
+        <div>
+          <div class="mono" style="font-size:11px;color:#5C574C;letter-spacing:2px;">KAKEIBO LEDGER</div>
+          <div style="font-size:24px;font-weight:900;margin-top:2px;">${monthLabel(currentMonthKey)}の家計台帳</div>
+        </div>
+        <div style="width:78px;height:78px;border-radius:50%;border:3px solid #A63A3A;color:#A63A3A;display:flex;flex-direction:column;align-items:center;justify-content:center;transform:rotate(-8deg);background:rgba(166,58,58,0.04);flex-shrink:0;">
+          <div class="mono" style="font-size:9px;font-weight:700;">今月計</div>
+          <div class="mono" style="font-size:13px;font-weight:700;text-align:center;">${yen(total)}</div>
+        </div>
+      </div>
+
+      ${diff !== null ? `
+      <div class="card" style="padding:10px 14px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;">
+        <span style="font-size:13px;color:#5C574C;">先月比</span>
+        <span class="mono" style="font-size:15px;font-weight:700;color:${diff<=0 ? '#4B6B4E' : '#A63A3A'};">${diff<=0?'▼ ':'▲ '}${yen(Math.abs(diff))}</span>
+      </div>` : ``}
+
+      <div class="section-label"><span class="idx">01</span><span class="title">月ごとの支出</span><div class="line"></div></div>
+      <div class="card" id="monthChartWrap" style="padding:12px 8px 4px;margin-bottom:20px;"></div>
+
+      <div class="section-label"><span class="idx">02</span><span class="title">カテゴリ別の内訳</span><div class="line"></div></div>
+      ${byCategory.length === 0 ? `<div class="empty">今月のレシートはまだありません</div>` : `
+      <div class="card" style="padding:14px;margin-bottom:20px;display:flex;align-items:center;gap:12px;">
+        <div id="catChartWrap" style="width:110px;height:110px;flex-shrink:0;"></div>
+        <div style="flex:1;">
+          ${byCategory.sort((a,b)=>b.value-a.value).map(c => `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:${CATEGORY_COLORS[c.name]};display:inline-block;"></span>
+                <span style="font-size:12.5px;">${c.name}</span>
+              </div>
+              <span class="mono" style="font-size:12.5px;font-weight:600;">${yen(c.value)}</span>
+            </div>`).join("")}
+        </div>
+      </div>`}
+
+      <div class="section-label"><span class="idx">03</span><span class="title">レシートを記帳する</span><div class="line"></div></div>
+      <div style="display:flex;gap:8px;margin-bottom:14px;">
+        <button id="cameraLiveBtn" class="btn-primary">📷 その場で撮影</button>
+        <label id="cameraBtn" for="cameraInput" class="btn-secondary" style="display:flex;align-items:center;justify-content:center;">アルバムから選ぶ</label>
+      </div>
+      <div style="margin-bottom:14px;">
+        <button id="manualBtn" class="btn-secondary" style="width:100%;">+ 手入力で追加</button>
+      </div>
+      <input id="cameraInput" type="file" accept="image/*" style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;" />
+      <div id="statusMsg" style="font-size:11.5px;color:#5C574C;margin:-8px 0 10px;"></div>
+      <div id="liveCameraWrap"></div>
+
+      <div id="manualFormWrap"></div>
+      <div id="pendingWrap"></div>
+
+      <div class="section-label"><span class="idx">04</span><span class="title">記帳履歴</span><div class="line"></div></div>
+      ${receipts.length === 0 ? `<div class="empty">まだ記帳がありません。撮影か手入力で最初の一件を追加してください</div>` : `
+      <div class="card" style="overflow:hidden;">
+        ${receipts.map(r => `
+          <div class="row">
+            <div>
+              <div style="font-size:13.5px;font-weight:500;">${r.store}</div>
+              <div style="display:flex;align-items:center;gap:6px;margin-top:2px;">
+                <span class="mono" style="font-size:10px;color:${CATEGORY_COLORS[r.category]};border:1px solid ${CATEGORY_COLORS[r.category]};border-radius:2px;padding:1px 5px;">${r.category}</span>
+                <span class="mono" style="font-size:10.5px;color:#5C574C;">${r.date.slice(5).replace('-','/')}</span>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;">
+              <span class="mono" style="font-size:14px;font-weight:700;">${yen(r.amount)}</span>
+              <button data-del="${r.id}" style="background:none;border:none;color:#5C574C;font-size:16px;padding:4px;">×</button>
+            </div>
+          </div>`).join("")}
+      </div>`}
+    `;
+
+    // チャート描画(外部ライブラリなし・SVGを直接組み立て)
+    try {
+      renderBarChart(document.getElementById("monthChartWrap"), history, currentMonthKey);
+      const catWrap = document.getElementById("catChartWrap");
+      if (catWrap) renderDonutChart(catWrap, byCategory);
+    } catch (chartErr) {
+      console.error("グラフの描画に失敗しました", chartErr);
+    }
+
+    // イベント紐付け
+    const cameraInput = document.getElementById("cameraInput");
+    cameraInput.addEventListener("change", e => {
+      setStatus("");
+      handleFile(e.target.files && e.target.files[0]);
+    });
+    document.getElementById("cameraLiveBtn").addEventListener("click", startLiveCamera);
+    document.getElementById("manualBtn").addEventListener("click", () => {
+      renderManualForm();
+    });
+    document.querySelectorAll("[data-del]").forEach(btn => {
+      btn.addEventListener("click", () => deleteReceipt(btn.getAttribute("data-del")));
+    });
+
+    renderPending();
+  }
+
+  let mediaStream = null;
+
+  async function startLiveCamera() {
+    const wrap = document.getElementById("liveCameraWrap");
+    wrap.innerHTML = `
+      <div class="card" style="padding:10px;margin-bottom:16px;">
+        <video id="liveVideo" autoplay playsinline muted style="width:100%;border-radius:3px;background:#000;"></video>
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <button id="shutterBtn" class="btn-primary">シャッター</button>
+          <button id="closeCamBtn" class="btn-secondary">閉じる</button>
+        </div>
+        <div id="camError" style="font-size:11.5px;color:#A63A3A;margin-top:6px;"></div>
+      </div>`;
+    document.getElementById("closeCamBtn").addEventListener("click", stopLiveCamera);
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      const video = document.getElementById("liveVideo");
+      video.srcObject = mediaStream;
+      document.getElementById("shutterBtn").addEventListener("click", () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext("2d").drawImage(video, 0, 0);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+        stopLiveCamera();
+        pendingImage = { dataUrl, guessedAmount: null, store: "", category: "食費", loading: true, error: false };
+        render();
+        runOcr(dataUrl);
+      });
+    } catch (err) {
+      document.getElementById("camError").textContent = "カメラを起動できませんでした。「アルバムから選ぶ」をお試しください";
+    }
+  }
+
+  function stopLiveCamera() {
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    const wrap = document.getElementById("liveCameraWrap");
+    if (wrap) wrap.innerHTML = "";
+  }
+
+  async function runOcr(dataUrl) {
+    try {
+      if (typeof Tesseract === "undefined") throw new Error("Tesseractが読み込まれていません");
+      const { data } = await Tesseract.recognize(dataUrl, "jpn+eng");
+      pendingImage.rawText = data.text || "";
+      pendingImage.guessedAmount = guessAmount(data.text) || "";
+      pendingImage.store = guessStore(data.text) || "";
+      pendingImage.loading = false;
+    } catch (err) {
+      pendingImage.loading = false;
+      pendingImage.error = true;
+      setStatus("文字の読み取りに失敗しました。金額は手入力してください");
+    }
+    render();
+  }
+
+  // 外部ライブラリなしでSVGの棒グラフを描画
+  function renderBarChart(container, history, currentMonthKey) {
+    if (!container) return;
+    const w = 300, h = 150, padL = 40, padB = 20, padT = 10;
+    const max = Math.max(1, ...history.map(h => h.total));
+    const barW = (w - padL - 10) / history.length;
+    let bars = "", labels = "", gridLines = "";
+    for (let i = 0; i <= 3; i++) {
+      const y = padT + (h - padT - padB) * (1 - i / 3);
+      gridLines += `<line x1="${padL}" y1="${y}" x2="${w}" y2="${y}" stroke="#C7BFAB" stroke-width="1"/>`;
+      gridLines += `<text x="${padL - 6}" y="${y + 3}" font-size="9" fill="#5C574C" text-anchor="end" font-family="'JetBrains Mono',monospace">¥${Math.round(max * i / 3 / 1000)}k</text>`;
+    }
+    history.forEach((hItem, i) => {
+      const barH = (h - padT - padB) * (hItem.total / max);
+      const x = padL + i * barW + barW * 0.15;
+      const y = h - padB - barH;
+      const bw = barW * 0.7;
+      const color = hItem.key === currentMonthKey ? "#A63A3A" : "#33475B";
+      bars += `<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(barH,1)}" rx="3" fill="${color}"/>`;
+      labels += `<text x="${x + bw/2}" y="${h - 4}" font-size="11" fill="#5C574C" text-anchor="middle">${hItem.month}</text>`;
+    });
+    container.innerHTML = `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:150px;">${gridLines}${bars}${labels}</svg>`;
+  }
+
+  // 外部ライブラリなしでSVGのドーナツグラフを描画
+  function renderDonutChart(container, byCategory) {
+    if (!container) return;
+    const total = byCategory.reduce((s,c) => s + c.value, 0);
+    if (total <= 0) { container.innerHTML = ""; return; }
+    const cx = 55, cy = 55, r = 45, innerR = 27;
+
+    // カテゴリが1つだけ(100%)の場合は円弧が描けないため、環状(ドーナツ)を直接描く
+    if (byCategory.length === 1) {
+      const color = CATEGORY_COLORS[byCategory[0].name] || "#8A8375";
+      container.innerHTML = `<svg viewBox="0 0 110 110" style="width:100%;height:100%;">
+        <circle cx="${cx}" cy="${cy}" r="${(r+innerR)/2}" fill="none" stroke="${color}" stroke-width="${r-innerR}"/>
+      </svg>`;
+      return;
+    }
+
+    let angle = -90;
+    let paths = "";
+    byCategory.forEach(c => {
+      const frac = c.value / total;
+      const sweep = frac * 360;
+      const endAngle = angle + sweep;
+      const largeArc = sweep > 180 ? 1 : 0;
+      const toRad = a => (a * Math.PI) / 180;
+      const x1 = cx + r * Math.cos(toRad(angle)), y1 = cy + r * Math.sin(toRad(angle));
+      const x2 = cx + r * Math.cos(toRad(endAngle)), y2 = cy + r * Math.sin(toRad(endAngle));
+      const ix1 = cx + innerR * Math.cos(toRad(angle)), iy1 = cy + innerR * Math.sin(toRad(angle));
+      const ix2 = cx + innerR * Math.cos(toRad(endAngle)), iy2 = cy + innerR * Math.sin(toRad(endAngle));
+      const color = CATEGORY_COLORS[c.name] || "#8A8375";
+      paths += `<path d="M${x1},${y1} A${r},${r} 0 ${largeArc} 1 ${x2},${y2} L${ix2},${iy2} A${innerR},${innerR} 0 ${largeArc} 0 ${ix1},${iy1} Z" fill="${color}"/>`;
+      angle = endAngle;
+    });
+    container.innerHTML = `<svg viewBox="0 0 110 110" style="width:100%;height:100%;">${paths}</svg>`;
+  }
+
+  function renderManualForm() {
+    const wrap = document.getElementById("manualFormWrap");
+    wrap.innerHTML = `
+      <div class="card" style="padding:12px;margin-bottom:16px;display:flex;flex-direction:column;gap:8px;">
+        <input id="mStore" class="input" placeholder="店名" />
+        <input id="mAmount" class="input" placeholder="金額" type="number" />
+        <select id="mCategory" class="input">${CATEGORIES.map(c=>`<option value="${c}">${c}</option>`).join("")}</select>
+        <button id="mSubmit" style="background:#A63A3A;color:#FBFAF6;border:none;border-radius:3px;padding:9px 0;font-size:13px;font-weight:700;">記帳する</button>
+      </div>`;
+    document.getElementById("mSubmit").addEventListener("click", () => {
+      const store = document.getElementById("mStore").value;
+      const amount = document.getElementById("mAmount").value;
+      const category = document.getElementById("mCategory").value;
+      if (!store || !amount) return;
+      addReceipt({ id:String(Date.now())+Math.random().toString(36).slice(2,7), store, amount:Number(amount), category, date: todayISO() });
+    });
+  }
+
+  function renderPending() {
+    const wrap = document.getElementById("pendingWrap");
+    if (!pendingImage) { wrap.innerHTML = ""; return; }
+    wrap.innerHTML = `
+      <div class="card" style="padding:12px;margin-bottom:16px;">
+        <img src="${pendingImage.dataUrl}" style="width:100%;max-height:180px;object-fit:contain;border-radius:3px;margin-bottom:10px;background:#eee;" />
+        ${pendingImage.loading ? `<div style="text-align:center;font-size:12.5px;color:#5C574C;">文字を読み取り中…</div>` : `
+        <div style="font-size:12px;color:#5C574C;margin-bottom:8px;">${pendingImage.error ? '読み取りに失敗しました。金額を手入力してください' : '読み取り結果を確認・修正してください'}</div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <input id="pStore" class="input" placeholder="店名" value="${pendingImage.store||''}" />
+          <input id="pAmount" class="input" placeholder="金額" type="number" value="${pendingImage.guessedAmount||''}" />
+          <select id="pCategory" class="input">${CATEGORIES.map(c=>`<option value="${c}" ${c===pendingImage.category?'selected':''}>${c}</option>`).join("")}</select>
+          <div style="display:flex;gap:8px;">
+            <button id="pConfirm" class="btn-primary">記帳する</button>
+            <button id="pCancel" class="btn-secondary">取り消し</button>
+          </div>
+        </div>
+        ${pendingImage.rawText ? `<details style="margin-top:10px;"><summary style="font-size:11px;color:#5C574C;">読み取った文字を確認(デバッグ用)</summary><pre style="white-space:pre-wrap;font-size:10.5px;color:#5C574C;background:#F2EFE4;padding:8px;border-radius:3px;margin-top:6px;max-height:150px;overflow:auto;">${pendingImage.rawText.replace(/</g,"&lt;")}</pre></details>` : ``}`}
+      </div>`;
+    if (!pendingImage.loading) {
+      document.getElementById("pConfirm").addEventListener("click", () => {
+        confirmPending(
+          document.getElementById("pAmount").value,
+          document.getElementById("pStore").value,
+          document.getElementById("pCategory").value
+        );
+        render();
+      });
+      document.getElementById("pCancel").addEventListener("click", () => { pendingImage = null; render(); });
+    }
+  }
+
+  load();
+})();
+</script>
